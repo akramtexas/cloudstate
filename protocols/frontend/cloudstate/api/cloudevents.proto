@@ -1,0 +1,18 @@
+// gRPC interface for Cloud Events.
+
+syntax = "proto3";
+
+import "google/protobuf/descriptor.proto";
+
+package cloudstate.api;
+
+option java_package = "cloudstate.api";
+
+message CloudEvents {
+    string input_topic = 1;
+    string output_topic = 2;
+}
+
+extend google.protobuf.MethodOptions {
+    CloudEvents events = 50079;
+}
