@@ -4,6 +4,7 @@ syntax = "proto3";
 import "google/protobuf/empty.proto";
 import "cloudstate/entity_key.proto";
 import "google/api/annotations.proto";
+import "google/api/http.proto";
 import "cloudstate/api/cloudevents.proto";
 
 package com.example.shoppingcart;
