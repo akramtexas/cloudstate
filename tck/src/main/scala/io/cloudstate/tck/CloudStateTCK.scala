@@ -17,39 +17,48 @@
 package io.cloudstate.tck
 
 import akka.NotUsed
-import akka.actor.{ActorSystem, Scheduler}
-import akka.stream.ActorMaterializer
-import akka.stream.scaladsl.{Sink, Source}
+import akka.actor.{ActorSystem, CoordinatedShutdown, Props, Scheduler}
+import akka.stream.{ActorMaterializer, Materializer}
+import akka.stream.scaladsl.{Flow, Keep, Sink, Source}
 import akka.pattern.after
 import akka.grpc.GrpcClientSettings
 import com.google.protobuf.{ByteString => ProtobufByteString}
 import org.scalatest._
 import com.typesafe.config.{Config, ConfigFactory}
 
-import scala.concurrent.{Await, ExecutionContext, Future}
+import scala.concurrent.{Await, Awaitable, ExecutionContext, Future}
 import scala.concurrent.duration._
 import scala.util.Try
-import java.util.{Map => JMap}
+import java.util.{Locale, Map => JMap}
 import java.util.concurrent.TimeUnit
 import java.io.File
-import java.net.InetAddress
+import java.net.{InetAddress, URI}
 
+import akka.grpc.scaladsl.GrpcExceptionHandler
 import akka.http.scaladsl.{Http, HttpConnectionContext, UseHttp2}
 import akka.http.scaladsl.Http.ServerBinding
+import akka.http.scaladsl.model.Uri.Path
+import akka.http.scaladsl.model.Uri.Path.Segment
+import akka.http.scaladsl.model.ws.{InvalidUpgradeResponse, Message, UpgradeToWebSocket, ValidUpgrade, WebSocketRequest}
 import akka.http.scaladsl.model.{
   ContentTypes,
   HttpEntity,
+  HttpHeader,
   HttpMethods,
   HttpProtocols,
   HttpRequest,
   HttpResponse,
-  StatusCodes
+  StatusCodes,
+  Uri
 }
 import akka.http.scaladsl.unmarshalling._
 import io.cloudstate.protocol.entity._
 import com.example.shoppingcart.shoppingcart._
+import cloudstate.api.cloudevents._
 import akka.testkit.TestProbe
+import akka.util.ByteString
 import com.google.protobuf.empty.Empty
+import io.cloudstate.protocol.event_sourced.EventSourcedHandler.{notFound, partial}
 import io.cloudstate.protocol.event_sourced.{
   EventSourced,
   EventSourcedClient,
@@ -59,6 +68,9 @@ import io.cloudstate.protocol.event_sourced.{
   EventSourcedStreamIn,
   EventSourcedStreamOut
 }
+import io.grpc.netty.shaded.io.netty.handler.codec.http.DefaultHttpResponse
+
+import scala.collection.immutable
 
 object CloudStateTCK {
   private[this] final val PROXY = "proxy"
@@ -176,6 +188,7 @@ class CloudStateTCK(private[this] final val config: CloudStateTCK.Configuration)
     extends AsyncWordSpec
     with MustMatchers
     with BeforeAndAfterAll {
+
   import CloudStateTCK._
 
   private[this] final val system = ActorSystem("CloudStateTCK")
@@ -278,6 +291,7 @@ class CloudStateTCK(private[this] final val config: CloudStateTCK.Configuration)
         true // todo revisit this
       } // todo make configurable
     }
+
     try Option(shoppingClient).foreach(c => Await.result(c.close(), 10.seconds))
     finally try Option(backendProcess).foreach(destroy(config.proxy))
     finally Seq(entityDiscoveryClient, eventSourcedClient).foreach(c => Await.result(c.close(), 10.seconds))
@@ -328,7 +342,9 @@ class CloudStateTCK(private[this] final val config: CloudStateTCK.Configuration)
       val clientAction = r.clientAction.get
       clientAction.action must be('reply)
       clientAction.action.reply must be('defined)
-      withClue("Reply did not have the expected number of events: ") { r.events.size must be(events) }
+      withClue("Reply did not have the expected number of events: ") {
+        r.events.size must be(events)
+      }
       r
     }
 
@@ -348,6 +364,7 @@ class CloudStateTCK(private[this] final val config: CloudStateTCK.Configuration)
   final def correlate(cmd: Command, commandId: Long) = withClue("Command had the wrong id: ") {
     cmd.id must be(commandId)
   }
+
   final def unrelated(cmd: Command, commandId: Long) = withClue("Command had the wrong id: ") {
     cmd.id must not be commandId
   }
@@ -453,6 +470,136 @@ class CloudStateTCK(private[this] final val config: CloudStateTCK.Configuration)
         //Semantical test
         items1.toSet must equal(Set(LineItem(productId1, productName1, 12), LineItem(productId2, productName2, 33)))
         items2.toSet must equal(Set(LineItem(productId2, productName2, 33)))
+      }
+    }
+
+    // TODO: Test case for Evented API (is a WIP).
+    "verify that Commands can be passed into the same processing as commands coming in via HTTP+JSON" in {
+
+      // TODO: Superfluous (placeholder) code needs to be removed (starting here).
+      val sc = shoppingClient
+      import sc.{addItem, getCart, removeItem}
+      val userId = "testuser:2"
+      val productId1 = "testproduct:1"
+      val productId2 = "testproduct:2"
+      val productName1 = "Test Product 1"
+      val productName2 = "Test Product 2"
+      // TODO: Superfluous (placeholder) code needs to be removed (ending here).
+
+      // The CloudState proxy will have to be able to read the event source declarations
+      // in the proto of the user function, to wire things up.
+      CloudEvents().withInputTopic("get_carts")
+      CloudEvents().withOutputTopic("gotten_carts")
+      CloudEvents("first")
+
+      // TODO: Invocation via events should--to the user code--look just like responding to any request.
+      //  The response can then be directed, by the proxy, to some other configured topic.
+      frontendProcess.getInputStream.read()
+
+      // TODO: Send a pre-constructed HttpRequest in, then get the HttpResponse, and
+      //  finally send it into the out-topic
+
+      implicit val mat = ActorMaterializer()
+      implicit val actorSystem: ActorSystem = ActorSystem()
+      import akka.http.scaladsl.Http
+      val http = Http()
+
+      val serviceBinding = Await.result(
+        http.bindAndHandle(
+          Flow[HttpRequest].map {
+            case hello if hello.uri.path.toString() == "/cloudstate/api/cloudevent1" =>
+              HttpResponse(entity = HttpEntity("Cloudevent1!"))
+            case req if req.uri.path.toString() == "/cloudstate/api/cloudevent1-headers" =>
+              HttpResponse(entity = HttpEntity(req.headers.map(h => s"${h.name()}: ${h.value}").mkString("\n")))
+          },
+          "localhost",
+          port = 0
+        ),
+        10.seconds
+      )
+      val responseFuture: Future[HttpResponse] =
+        Http().singleRequest(HttpRequest(uri = "http://localhost:8080/cloudevent1"))
+
+      handleRequest(HttpRequest.apply(), productId1, Nil)
+
+      var servicePort: Int = _
+      servicePort = serviceBinding.localAddress.getPort
+      println(servicePort.toString)
+
+      // TODO: Add for additional events.
+      CloudEvents("second")
+      CloudEvents("third")
+
+      // TODO: Regarding adding an additional inflow of Commands....
+      //  How to incorporate the additional inflow whereby this test case can be exercised ?
+      //  Please see the note below:
+      /**
+       *  How to incorporate the following into the flow?
+       *
+       *   [HttpApi.scala]
+       *
+       *   override final def apply(req: HttpRequest): Future[HttpResponse] =
+       *       parseCommand(req).flatMap(command => sendCommand(command).map(createResponse)).recover {
+       *           case ire: IllegalRequestException => HttpResponse(ire.status.intValue, entity = ire.status.reason)
+       *       }
+       *
+       */
+      // TODO: The remainder of the code in this test case needs to be removed (starting here).
+      for {
+        Cart(Nil) <- getCart(GetShoppingCart(userId)) // Test initial state
+        Empty() <- addItem(AddLineItem(userId, productId1, productName1, 1)) // Test add the first product
+        Empty() <- addItem(AddLineItem(userId, productId2, productName2, 2)) // Test add the second product
+        Empty() <- addItem(AddLineItem(userId, productId1, productName1, 11)) // Test increase quantity
+        Empty() <- addItem(AddLineItem(userId, productId2, productName2, 31)) // Test increase quantity
+        Cart(items1) <- getCart(GetShoppingCart(userId)) // Test intermediate state
+        Empty() <- removeItem(RemoveLineItem(userId, productId1)) // Test removal of first product
+        addNeg <- addItem(AddLineItem(userId, productId2, productName2, -7))
+          .transform(scala.util.Success(_)) // Test decrement quantity of second product
+        add0 <- addItem(AddLineItem(userId, productId1, productName1, 0))
+          .transform(scala.util.Success(_)) // Test add 0 of new product
+        removeNone <- removeItem(RemoveLineItem(userId, productId1))
+          .transform(scala.util.Success(_)) // Test remove non-exiting product
+        Cart(items2) <- getCart(GetShoppingCart(userId)) // Test end state
+      } yield {
+        val init = fromBackend_expectInit(noWait)
+        init.entityId must not be (empty)
+
+        val commands = Seq((true, 0),
+                           (true, 1),
+                           (true, 1),
+                           (true, 1),
+                           (true, 1),
+                           (true, 0),
+                           (true, 1),
+                           (false, 0),
+                           (false, 0),
+                           (false, 0),
+                           (true, 0)).foldLeft(Set.empty[Long]) {
+          case (set, (isReply, eventCount)) =>
+            val cmd = fromBackend_expectCommand(noWait)
+            correlate(
+              cmd,
+              if (isReply) fromFrontend_expectReply(events = eventCount, noWait).commandId
+              else fromFrontend_expectFailure(noWait).commandId
+            )
+            init.entityId must be(cmd.entityId)
+            set must not contain (cmd.id)
+            set + cmd.id
+        }
+
+        eventSourcedFromBackend.expectNoMsg(noWait)
+        eventSourcedFromFrontend.expectNoMsg(noWait)
+
+        commands must have(size(11)) // Verify command id uniqueness
+
+        addNeg must be('failure) // Verfify that we get a failure when adding a negative quantity
+        add0 must be('failure) // Verify that we get a failure when adding a line item of 0 items
+        removeNone must be('failure) // Verify that we get a failure when removing a non-existing item
+
+        //Semantical test
+        items1.toSet must equal(Set(LineItem(productId1, productName1, 12), LineItem(productId2, productName2, 33)))
+        items2.toSet must equal(Set(LineItem(productId2, productName2, 33)))
+        // TODO: The remainder of the code in this test case needs to be removed (ending here).
       }
     }
 
@@ -596,6 +743,61 @@ class CloudStateTCK(private[this] final val config: CloudStateTCK.Configuration)
           """[{"productId":"B14623482","name":"Basic","quantity":1.0}]"""
         )
       }
+    }
+  }
+
+  /**
+   * The following snippets are from the following and related packages: com.lightbend.lagom.internal.api
+   */
+  object HeaderUtils {
+
+    /**
+     * Normalize an HTTP header name.
+     *
+     * @param name the header name
+     * @return the normalized header name
+     */
+    @inline
+    def normalize(name: String): String = name.toLowerCase(Locale.ENGLISH)
+
+  }
+
+  private val HeadersToFilter = Set(
+    "Timeout-Access",
+    "Upgrade",
+    "Connection",
+    "Host"
+  ).map(HeaderUtils.normalize)
+
+  private def filterHeaders(headers: immutable.Seq[HttpHeader]) =
+    headers.filterNot(header => HeadersToFilter(header.lowercaseName()))
+
+  private def handleRequest(request: HttpRequest, uri: Uri, upgrade: UpgradeToWebSocket) = {
+
+    implicit val mat = ActorMaterializer()
+    implicit val actorSystem: ActorSystem = ActorSystem()
+
+    val http = Http()
+    val wsUri = uri.withScheme("ws")
+    val flow =
+      Flow.fromSinkAndSourceMat(Sink.asPublisher[Message](fanout = false), Source.asSubscriber[Message])(Keep.both)
+
+    val (responseFuture, (publisher, subscriber)) = http.singleWebSocketRequest(
+      WebSocketRequest(wsUri, extraHeaders = filterHeaders(request.headers), upgrade.requestedProtocols.headOption),
+      flow
+    )
+
+    responseFuture.map {
+
+      case ValidUpgrade(response, chosenSubprotocol) =>
+        val webSocketResponse = upgrade.handleMessages(
+          Flow.fromSinkAndSource(Sink.fromSubscriber(subscriber), Source.fromPublisher(publisher)),
+          chosenSubprotocol
+        )
+        webSocketResponse.withHeaders(webSocketResponse.headers ++ filterHeaders(response.headers))
+
+      case InvalidUpgradeResponse(response, cause) =>
+        response
     }
   }
 }
