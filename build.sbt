@@ -349,7 +349,8 @@ lazy val `proxy-core` = (project in file("proxy/core"))
         "org.apache.kafka" % "kafka_2.11" % "2.1.1",
         "com.typesafe.akka" %% "akka-stream" % "2.5.21",
         "com.typesafe.akka" %% "akka-stream-kafka" % "1.0.2",
-        "io.spray" %%  "spray-json" % "1.3.5",
+        "io.spray" %% "spray-json" % "1.3.5",
+        "org.testcontainers" % "kafka" % "1.12.2",
         // Remove these explicit gRPC/netty dependencies once akka-grpc 0.7.1 is released and we've upgraded to using that
         "io.grpc" % "grpc-core" % GrpcJavaVersion,
         "io.grpc" % "grpc-netty-shaded" % GrpcJavaVersion,
