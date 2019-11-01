@@ -54,6 +54,7 @@ object Broker extends App with DefaultJsonProtocol {
 
   implicit val mat: Materializer = ActorMaterializer()
 
+  // TODO: Replace the following bootstrap code, which is taken from: https://github.com/akka/alpakka-samples
   val httpRequest =
     HttpRequest(uri = "https://www.nasdaq.com/screening/companies-by-name.aspx?exchange=NASDAQ&render=download")
       .withHeaders(Accept(MediaRanges.`text/*`))
