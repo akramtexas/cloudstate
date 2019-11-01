@@ -87,8 +87,7 @@ class BrokerSpec extends BaseSpec with BeforeAndAfterAll {
   val shoppingItems =
     List(ShoppingItem("joe", "can-opener"), ShoppingItem("akram", "hairbrush"), ShoppingItem("aardvark", "nuts"))
 
-//  BrokerUtils.
-
+  Broker.kafkaBroker.start()
   println("WRITE to input_topic")
   Broker.writeToTopic(shoppingItems)
 
